@@ -35,7 +35,7 @@
 - [2025/7/30] We released the [paper](https://arxiv.org/abs/2507.21802) and [code](https://github.com/Tencent-Hunyuan/MixGRPO) !
 
 ## ✅ TODO
-- [ ] Take comparison with the [FlowGRPO](https://github.com/yifan123/flow_grpo) and update our technical report.
+- [x] Take comparison with the [FlowGRPO](https://github.com/yifan123/flow_grpo) and update our technical report.
 
 ## 🚀 Quick Start
 
