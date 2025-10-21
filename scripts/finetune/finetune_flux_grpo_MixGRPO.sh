@@ -33,31 +33,31 @@ pick_score_https_proxy=None
 unified_reward_url=None
 
 # flux and reward models paths
-model_path="./data/flux"
+model_path="./data/sd3.5"
 hps_path="./hps_ckpt/HPS_v2.1_compressed.pt"
 hps_clip_path="./hps_ckpt/open_clip_pytorch_model.bin"
-clip_score_path="hf-hub:apple/DFN5B-CLIP-ViT-H-14-384"
+clip_score_path="./DFN5B-CLIP-ViT-H-14-384"
 image_reward_path="./image_reward_ckpt/ImageReward.pt"
 image_reward_med_config="./image_reward_ckpt/med_config.json"
 unified_reward_default_question_type="semantic"
 unified_reward_num_workers=1
 
 # Dataset
-data_json_path="data/rl_embeddings/prompt.json"
+data_json_path="data/rl_embeddings_sd3.5/prompt.json"
 
 # MixGRPO Hyperparameters
-experiment_name="1014_test"
-reward_model="multi_reward" # "hpsv2", "clip_score" "image_reward", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
+experiment_name="1021_test"
+reward_model="hpsv2" # "hpsv2", "clip_score" "image_reward", "pick_score", "unified_reward", "hpsv2_clip_score", "multi_reward"
 seed=714
 sampler_seed=7144
 training_strategy="part" # "part", "all"
-sampling_steps=25 # 图像生成采样步数
-eta=0.7 #GRPO 采样噪声强度
+sampling_steps=25
+eta=0.7
 kl_coeff=0.0
-iters_per_group=25 #SDE窗口滑动间距（多久滑动一次）
-group_size=4 #SDE窗口大小
+iters_per_group=25
+group_size=4
 sample_strategy="progressive"
-prog_overlap_step=1 #窗口移动大小，即和上一窗口末尾重叠一步
+prog_overlap_step=1
 trimmed_ratio=0.0
 multi_reward_mix="advantage_aggr" # "reward_aggr", "advantage_aggr"
 hps_weight=1.0
@@ -65,7 +65,7 @@ clip_score_weight=1.0
 image_reward_weight=1.0
 pick_score_weight=1.0
 unified_reward_weight=1.0
-gradient_accumulation_steps=12 #梯度积累步数
+gradient_accumulation_steps=12
 
 # DanceGRPO Sampling Parameters
 timestep_fraction=0.6
@@ -80,20 +80,21 @@ dpm_solver_type="midpoint"
 
 # Custom splitting nodes
 nnodes_custom=1
-nproc_per_node_custom=8
+nproc_per_node_custom=4
 CHIEF_IP_custom=$(head -n 1 $hostfile)
 INDEX_CUSTOME=0
 
 cur_path=$(pwd)
 
-
+# run multi-nodes with pdsh
 #export WANDB_DISABLED=true ;
 export WANDB_BASE_URL="https://api.wandb.ai" ;
-export WANDB_MODE=online ; #offline
+export WANDB_MODE=online ;
 export PYTHONPATH=$PYTHONPATH:$(pwd)
 
+
 echo "nnodes_custom=$nnodes_custom" ;
-echo "nproc_per_node=$nproc_per_node_custom" ;
+echo "nproc_per_node=$HOST_GPU_NUM" ;
 echo "INDEX_CUSTOME=$INDEX_CUSTOME" ;
 echo "CHIEF_IP_custom=$CHIEF_IP_custom" ;
 echo "free_port=$free_port" ;
@@ -110,7 +111,7 @@ torchrun --nnodes $nnodes_custom --nproc_per_node $nproc_per_node_custom --node_
     --num_latent_t 1 \
     --sp_size 1 \
     --train_sp_batch_size 1 \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers 0 \
     --gradient_accumulation_steps $gradient_accumulation_steps \
     --max_train_steps 300 \
     --learning_rate 1e-5 \
@@ -174,5 +175,5 @@ torchrun --nnodes $nnodes_custom --nproc_per_node $nproc_per_node_custom --node_
     --dpm_solver_type $dpm_solver_type \
     --frozen_init_timesteps $frozen_init_timesteps \
     --wandb_key $wandb_key \
-    --flow_grpo_sampling     
-    # --drop_last_sample
+    --flow_grpo_sampling   
+    # --drop_last_sample 

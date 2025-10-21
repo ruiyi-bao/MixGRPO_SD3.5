@@ -58,7 +58,7 @@ import torch.distributed as dist
 from torch.nn import functional as F
 from typing import List
 from PIL import Image
-from diffusers import FluxTransformer2DModel, AutoencoderKL
+from diffusers import SD3Transformer2DModel, AutoencoderKL
 from fastvideo.utils.grpo_states import GRPOTrainingStates
 import json
 from fastvideo.models.reward_model.image_reward import ImageRewardModel
@@ -75,49 +75,12 @@ from fastvideo.utils.sampling_utils import flow_grpo_step, dance_grpo_step, run_
 def assert_eq(x, y, msg=None):
     assert x == y, f"{msg or 'Assertion failed'}: {x} != {y}"
 
-def prepare_latent_image_ids(batch_size, height, width, device, dtype):
-    latent_image_ids = torch.zeros(height, width, 3)
-    latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
-    latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
-
-    latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
-
-    latent_image_ids = latent_image_ids.reshape(
-        latent_image_id_height * latent_image_id_width, latent_image_id_channels
-    )
-
-    return latent_image_ids.to(device=device, dtype=dtype)
-
-def pack_latents(latents, batch_size, num_channels_latents, height, width):
-    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
-
-    return latents
-
-def unpack_latents(latents, height, width, vae_scale_factor):
-    batch_size, num_patches, channels = latents.shape
-
-    # VAE applies 8x compression on images but we must also account for packing which requires
-    # latent height and width to be divisible by 2.
-    height = 2 * (int(height) // (vae_scale_factor * 2))
-    width = 2 * (int(width) // (vae_scale_factor * 2))
-
-    latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
-    latents = latents.permute(0, 3, 1, 4, 2, 5)
-
-    latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
-
-    return latents
-
 def grpo_one_step(
     args,
     latents,
     pre_latents,
     encoder_hidden_states, 
     pooled_prompt_embeds, 
-    text_ids,
-    image_ids,
     transformer,
     timesteps,
     i,
@@ -129,15 +92,8 @@ def grpo_one_step(
         pred= transformer(
             hidden_states=latents,
             encoder_hidden_states=encoder_hidden_states,
-            timestep=timesteps/1000,
-            guidance=torch.tensor(
-                [3.5],
-                device=latents.device,
-                dtype=torch.bfloat16
-            ),
-            txt_ids=text_ids.repeat(encoder_hidden_states.shape[1],1), # B, L
+            timestep=timesteps,
             pooled_projections=pooled_prompt_embeds,
-            img_ids=image_ids.squeeze(0),
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
@@ -175,7 +131,6 @@ def sample_reference_model(
     vae,
     encoder_hidden_states, 
     pooled_prompt_embeds, 
-    text_ids,
     reward_models,
     caption,
     timesteps_train, # index
@@ -206,7 +161,6 @@ def sample_reference_model(
     all_log_probs = []
     all_rewards = []  
     all_multi_rewards = {}
-    all_image_ids = []
     if args.init_same_noise:
         input_latents = torch.randn(
                 (1, IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
@@ -218,18 +172,31 @@ def sample_reference_model(
     for index, batch_idx in enumerate(batch_indices): # len(batch_indices)=12
         if dist.get_rank() == 0:
             meta_sampling_time = time.time()
+        
+        # Debug: print shapes before indexing
+        if dist.get_rank() == 0 and index == 0:
+            print(f"\n[DEBUG sample_reference_model] Before indexing:")
+            print(f"  encoder_hidden_states shape: {encoder_hidden_states.shape}")
+            print(f"  pooled_prompt_embeds shape: {pooled_prompt_embeds.shape}")
+            print(f"  batch_idx: {batch_idx}, type: {type(batch_idx)}")
+        
         batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
         batch_pooled_prompt_embeds = pooled_prompt_embeds[batch_idx]
-        batch_text_ids = text_ids[batch_idx]
         batch_caption = [caption[i] for i in batch_idx]
+        
+        # Debug: print shapes after indexing
+        if dist.get_rank() == 0 and index == 0:
+            print(f"[DEBUG sample_reference_model] After indexing:")
+            print(f"  batch_encoder_hidden_states shape: {batch_encoder_hidden_states.shape}")
+            print(f"  batch_pooled_prompt_embeds shape: {batch_pooled_prompt_embeds.shape}\n")
         if not args.init_same_noise:
             input_latents = torch.randn(
                     (len(batch_idx), IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
                     device=device,
                     dtype=torch.bfloat16,
                 )
-        input_latents_new = pack_latents(input_latents, len(batch_idx), IN_CHANNELS, latent_h, latent_w)
-        image_ids = prepare_latent_image_ids(len(batch_idx), latent_h // 2, latent_w // 2, device, torch.bfloat16)
+        input_latents_new = input_latents
+        #image_ids = prepare_latent_image_ids(len(batch_idx), latent_h // 2, latent_w // 2, device, torch.bfloat16)
         grpo_sample=True
         progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress", disable=not dist.is_initialized() or dist.get_rank() != 0)
 
@@ -249,8 +216,6 @@ def sample_reference_model(
                 transformer,
                 batch_encoder_hidden_states,
                 batch_pooled_prompt_embeds,
-                batch_text_ids,
-                image_ids,
                 grpo_sample,
                 determistic=determistic,
             )
@@ -258,7 +223,6 @@ def sample_reference_model(
             sampling_time += time.time() - meta_sampling_time
             main_print(f"##### Sampling time per data: {sampling_time/(index+1)} seconds")
         
-        all_image_ids.append(image_ids)
         all_latents.append(batch_latents)
         all_log_probs.append(batch_log_probs)
         vae.enable_tiling()
@@ -269,15 +233,14 @@ def sample_reference_model(
         
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                latents = unpack_latents(latents, h, w, 8)
-                latents = (latents / 0.3611) + 0.1159
+                latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
                 image = vae.decode(latents, return_dict=False)[0]
                 decoded_image = image_processor.postprocess(
                 image)
         image_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/images"
         os.makedirs(image_dir, exist_ok=True)
         if index == 0:
-            decoded_image[0].save(f"{image_dir}/flux_{global_step}_{rank}.png")
+            decoded_image[0].save(f"{image_dir}/sd35_{global_step}_{rank}.png")
 
         # compute rewards
         with torch.no_grad():
@@ -311,9 +274,8 @@ def sample_reference_model(
         all_rewards_res = {}
         for model_name, model_rewards in all_multi_rewards.items():
             all_rewards_res[model_name] = torch.cat(model_rewards["rewards"], dim=0)
-    all_image_ids = torch.stack(all_image_ids, dim=0)
     
-    return all_rewards_res, all_latents, all_log_probs, sigma_schedule, all_image_ids
+    return all_rewards_res, all_latents, all_log_probs, sigma_schedule
 
 
 def gather_tensor(tensor):
@@ -347,10 +309,10 @@ def train_one_step(
     (
         encoder_hidden_states, 
         pooled_prompt_embeds, 
-        text_ids,
         caption,
     ) = next(loader)
     #device = latents.device
+    #按群采样次数复制输入prompt（12次）
     if args.use_group:
         def repeat_tensor(tensor):
             if tensor is None:
@@ -359,7 +321,6 @@ def train_one_step(
 
         encoder_hidden_states = repeat_tensor(encoder_hidden_states)
         pooled_prompt_embeds = repeat_tensor(pooled_prompt_embeds)
-        text_ids = repeat_tensor(text_ids)
 
 
         if isinstance(caption, str):
@@ -369,14 +330,13 @@ def train_one_step(
         else:
             raise ValueError(f"Unsupported caption type: {type(caption)}")
 
-    reward, all_latents, all_log_probs, sigma_schedule, all_image_ids = sample_reference_model(
+    reward, all_latents, all_log_probs, sigma_schedule = sample_reference_model(
             args,
             device, 
             transformer,
             vae,
             encoder_hidden_states, 
             pooled_prompt_embeds, 
-            text_ids,
             reward_models,
             caption,
             timesteps_train,
@@ -398,8 +358,6 @@ def train_one_step(
             :, 1:
         ][:, :-1],  # each entry is the latent after timestep t
         "log_probs": all_log_probs[:, :-1],
-        "image_ids": all_image_ids,
-        "text_ids": text_ids,
         "encoder_hidden_states": encoder_hidden_states,
         "pooled_prompt_embeds": pooled_prompt_embeds,
     }
@@ -417,7 +375,7 @@ def train_one_step(
     if dist.get_rank()==0:
         print(f"gathered_{args.reward_model}", gathered_reward)
         reward_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}"
-        with open(f'{reward_dir}/flux_{args.reward_model}_{args.training_strategy}_{args.experiment_name}.txt', 'a') as f: 
+        with open(f'{reward_dir}/sd35_{args.reward_model}_{args.training_strategy}_{args.experiment_name}.txt', 'a') as f: 
             if args.multi_reward_mix == "advantage_aggr":
                 for model_name, model_rewards in gathered_reward.items():
                     f.write(f"{model_name}: {model_rewards.mean().item()}\n")
@@ -552,8 +510,6 @@ def train_one_step(
                 sample["next_latents"][:,_],
                 sample["encoder_hidden_states"],
                 sample["pooled_prompt_embeds"],
-                sample["text_ids"],
-                sample["image_ids"],
                 transformer,
                 sample["timesteps"][:,_],
                 perms[i][_] if args.training_strategy == "all" else _,
@@ -771,14 +727,13 @@ def main(args):
 
     print(f"reward_weights: {reward_weights}")
 
-    ############################# Build FLUX #############################
+    ############################# Build SD3.5 #############################
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
     # keep the master weight to float32
 
-    transformer = FluxTransformer2DModel.from_pretrained(
+    transformer = SD3Transformer2DModel.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="transformer",
-            torch_dtype = torch.bfloat16
     )
     
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
@@ -816,7 +771,7 @@ def main(args):
 
     params_to_optimize = transformer.parameters()
     params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
-
+    #不知道要不要改
     optimizer = torch.optim.AdamW(
         params_to_optimize,
         lr=args.learning_rate,
@@ -857,7 +812,7 @@ def main(args):
     #vae.enable_tiling()
 
     if rank <= 0:
-        project = "flux"
+        project = "sd3.5"
         wandb_run = wandb.init(
             project=project, 
             config=args, 
@@ -1537,7 +1492,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    wandb.login(key=args.wandb_key)
+    wandb.login(key=args.wandb_key, relogin=True)
 
     if args.image_reward_http_proxy == "None":
         args.image_reward_http_proxy = None

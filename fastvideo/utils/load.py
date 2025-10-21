@@ -21,6 +21,8 @@ from fastvideo.models.mochi_hf.modeling_mochi import (MochiTransformer3DModel,
                                                       MochiTransformerBlock)
 from fastvideo.utils.logging_ import main_print
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel, FluxTransformerBlock, FluxSingleTransformerBlock
+from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
+from diffusers.models.transformers.transformer_sd3 import JointTransformerBlock
 
 hunyuan_config = {
     "mm_double_blocks_depth": 20,
@@ -368,6 +370,8 @@ def get_no_split_modules(transformer):
         return (MMDoubleStreamBlock, MMSingleStreamBlock)
     elif isinstance(transformer, FluxTransformer2DModel):
         return (FluxTransformerBlock, FluxSingleTransformerBlock)
+    elif isinstance(transformer, SD3Transformer2DModel):
+        return (JointTransformerBlock, )
     else:
         raise ValueError(f"Unsupported transformer type: {type(transformer)}")
 

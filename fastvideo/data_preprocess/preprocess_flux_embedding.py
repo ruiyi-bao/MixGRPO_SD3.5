@@ -25,7 +25,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import re
-from diffusers import FluxPipeline
+from diffusers import StableDiffusion3Pipeline
 
 def contains_chinese(text):
     return bool(re.search(r'[\u4e00-\u9fff]', text))
@@ -76,7 +76,6 @@ def main(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "prompt_embed"), exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "text_ids"), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "pooled_prompt_embeds"), exist_ok=True)
 
     latents_txt_path = args.prompt_path
@@ -90,8 +89,8 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
-    pipe = FluxPipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16, device_map="balanced")
-    # pipe = FluxPipeline.from_pretrained("./data/flux").to(device)
+    pipe = StableDiffusion3Pipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16).to(device)
+    # pipe = StableDiffusion3Pipeline.from_pretrained("./data/sd3.5", torch_dtype=torch.bfloat16).to(device)
 
     json_data = []
     for _, data in tqdm(enumerate(train_dataloader), disable=local_rank != 0):
@@ -100,8 +99,17 @@ def main(args):
                     if args.vae_debug:
                         latents = data["latents"]
                     for idx, video_name in enumerate(data["filename"]):
-                        prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt(
-                            prompt=data["caption"], prompt_2=data["caption"]
+                        # SD3.5 encode_prompt returns (prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds)
+                        (
+                            prompt_embeds,
+                            negative_prompt_embeds,
+                            pooled_prompt_embeds,
+                            negative_pooled_prompt_embeds,
+                        ) = pipe.encode_prompt(
+                            prompt=data["caption"],
+                            prompt_2=data["caption"],
+                            prompt_3=data["caption"],
+                            device=device,
                         )
                         prompt_embed_path = os.path.join(
                             args.output_dir, "prompt_embed", video_name + ".pt"
@@ -109,17 +117,13 @@ def main(args):
                         pooled_prompt_embeds_path = os.path.join(
                             args.output_dir, "pooled_prompt_embeds", video_name + ".pt"
                         )
-
-                        text_ids_path = os.path.join(
-                            args.output_dir, "text_ids", video_name + ".pt"
-                        )
-                        # save latent
-                        torch.save(prompt_embeds[idx], prompt_embed_path)
-                        torch.save(pooled_prompt_embeds[idx], pooled_prompt_embeds_path)
-                        torch.save(text_ids[idx], text_ids_path)    
+                        
+                        # Save embeddings
+                        torch.save(prompt_embeds, prompt_embed_path)
+                        torch.save(pooled_prompt_embeds, pooled_prompt_embeds_path)
+                        
                         item = {}
                         item["prompt_embed_path"] = video_name + ".pt"
-                        item["text_ids"] = video_name + ".pt"
                         item["pooled_prompt_embeds_path"] = video_name + ".pt"   
                         item["caption"] = data["caption"][idx]             
                         json_data.append(item)
@@ -141,8 +145,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # dataset & dataloader
-    parser.add_argument("--model_path", type=str, default="data/mochi")
-    parser.add_argument("--model_type", type=str, default="mochi")
+    parser.add_argument("--model_path", type=str, default="stabilityai/stable-diffusion-3.5-large")
+    parser.add_argument("--model_type", type=str, default="sd3.5")
     # text encoder & vae & diffusion model
     parser.add_argument(
         "--dataloader_num_workers",

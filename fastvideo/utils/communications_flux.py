@@ -260,18 +260,17 @@ def all_gather(input_: torch.Tensor, dim: int = 1):
 
 
 def prepare_sequence_parallel_data(
-    encoder_hidden_states, pooled_prompt_embeds, text_ids, caption
+    encoder_hidden_states, pooled_prompt_embeds, caption
 ):
     if nccl_info.sp_size == 1:
         return (
             encoder_hidden_states,
-            pooled_prompt_embeds,
-            text_ids, 
+            pooled_prompt_embeds, 
             caption,
         )
 
     def prepare(
-        encoder_hidden_states, pooled_prompt_embeds, text_ids, caption
+        encoder_hidden_states, pooled_prompt_embeds, caption
     ):
         #hidden_states = all_to_all(hidden_states, scatter_dim=2, gather_dim=0)
         encoder_hidden_states = all_to_all(
@@ -281,11 +280,9 @@ def prepare_sequence_parallel_data(
         pooled_prompt_embeds = all_to_all(
             pooled_prompt_embeds, scatter_dim=1, gather_dim=0
         )
-        text_ids = all_to_all(text_ids, scatter_dim=1, gather_dim=0)
         return (
             encoder_hidden_states,
             pooled_prompt_embeds,
-            text_ids, 
             caption,
         )
 
@@ -296,17 +293,15 @@ def prepare_sequence_parallel_data(
     (
         encoder_hidden_states,
         pooled_prompt_embeds,
-        text_ids, 
         caption,
     ) = prepare(
         #hidden_states,
         encoder_hidden_states.repeat(1, sp_size, 1),
         pooled_prompt_embeds.repeat(1, sp_size, 1, 1),
-        text_ids.repeat(1, sp_size),
         caption,
     )
 
-    return encoder_hidden_states, pooled_prompt_embeds, text_ids, caption
+    return encoder_hidden_states, pooled_prompt_embeds, caption
 
 
 def sp_parallel_dataloader_wrapper(
@@ -314,18 +309,17 @@ def sp_parallel_dataloader_wrapper(
 ):
     while True:
         for data_item in dataloader:
-            encoder_hidden_states, pooled_prompt_embeds, text_ids, caption = data_item
+            encoder_hidden_states, pooled_prompt_embeds, caption = data_item
             #latents = latents.to(device)
             encoder_hidden_states = encoder_hidden_states.to(device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(device)
-            text_ids = text_ids.to(device)
             #frame = latents.shape[2]
             frame = 19
             if frame == 1:
-                yield encoder_hidden_states, pooled_prompt_embeds, text_ids, caption
+                yield encoder_hidden_states, pooled_prompt_embeds, caption
             else:
-                encoder_hidden_states, pooled_prompt_embeds, text_ids, caption = prepare_sequence_parallel_data(
-                    encoder_hidden_states, pooled_prompt_embeds, text_ids, caption
+                encoder_hidden_states, pooled_prompt_embeds, caption = prepare_sequence_parallel_data(
+                    encoder_hidden_states, pooled_prompt_embeds, caption
                 )
                 assert (
                     train_batch_size * sp_size >= train_sp_batch_size
@@ -335,11 +329,9 @@ def sp_parallel_dataloader_wrapper(
                     ed_idx = (iter + 1) * train_sp_batch_size
                     encoder_hidden_states = encoder_hidden_states[st_idx:ed_idx]
                     pooled_prompt_embeds = pooled_prompt_embeds[st_idx:ed_idx]
-                    text_ids = text_ids[st_idx:ed_idx]
                     yield (
                             encoder_hidden_states,
                             pooled_prompt_embeds,
-                            text_ids, 
                             caption,
                     )
 

@@ -1,8 +1,9 @@
 #!/bin/bash
 
-GPU_NUM=2 # 2,4,8
-MODEL_PATH="data/flux"
-OUTPUT_DIR="data/rl_embeddings"
+GPU_NUM=4 # 2,4,8
+MODEL_PATH="data/sd3.5"
+OUTPUT_DIR="data/rl_embeddings_sd3.5"
+#OUTPUT_DIR="data/rl_embeddings"
 
 torchrun --nproc_per_node=$GPU_NUM --master_port 19002 \
     fastvideo/data_preprocess/preprocess_flux_embedding.py \

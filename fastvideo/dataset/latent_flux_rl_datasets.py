@@ -17,6 +17,10 @@ import random
 
 
 class LatentDataset(Dataset):
+    """
+    SD3.5 Dataset for loading pre-computed embeddings
+    Note: text_ids is delected (unlike Flux)
+    """
     def __init__(
         self, json_path, num_latent_t, cfg_rate,
     ):
@@ -30,15 +34,14 @@ class LatentDataset(Dataset):
         self.pooled_prompt_embeds_dir = os.path.join(
             self.datase_dir_path, "pooled_prompt_embeds"
         )
-        self.text_ids_dir = os.path.join(
-            self.datase_dir_path, "text_ids"
-        )
+        # SD3.5 doesn't use text_ids, removed text_ids_dir
+        
         with open(self.json_path, "r") as f:
             self.data_anno = json.load(f)
         # json.load(f) already keeps the order
         # self.data_anno = sorted(self.data_anno, key=lambda x: x['latent_path'])
         self.num_latent_t = num_latent_t
-        # just zero embeddings [256, 4096]
+        # just zero embeddings [256, 4096] for CFG
         self.uncond_prompt_embed = torch.zeros(256, 4096).to(torch.float32)
         # 256 zeros
         self.uncond_prompt_mask = torch.zeros(256).bool()
@@ -51,9 +54,17 @@ class LatentDataset(Dataset):
         #latent_file = self.data_anno[idx]["latent_path"]
         prompt_embed_file = self.data_anno[idx]["prompt_embed_path"]
         pooled_prompt_embeds_file = self.data_anno[idx]["pooled_prompt_embeds_path"]
-        text_ids_file = self.data_anno[idx]["text_ids"]
+        # SD3.5 doesn't use text_ids
+        
         if random.random() < self.cfg_rate:
             prompt_embed = self.uncond_prompt_embed
+            pooled_prompt_embeds = torch.zeros_like(torch.load(
+                os.path.join(
+                    self.pooled_prompt_embeds_dir, pooled_prompt_embeds_file
+                ),
+                map_location="cpu",
+                weights_only=True,
+            ))
         else:
             prompt_embed = torch.load(
                 os.path.join(self.prompt_embed_dir, prompt_embed_file),
@@ -67,31 +78,34 @@ class LatentDataset(Dataset):
                 map_location="cpu",
                 weights_only=True,
             )
-            text_ids = torch.load(
-                os.path.join(
-                    self.text_ids_dir, text_ids_file
-                ),
-                map_location="cpu",
-                weights_only=True,
-            )
-        return prompt_embed, pooled_prompt_embeds, text_ids, self.data_anno[idx]['caption']
+        
+        # Remove extra dimensions if present
+        # Expected shapes: prompt_embed [seq_len, hidden_size], pooled_prompt_embeds [hidden_size]
+        # If shapes are [1, seq_len, hidden_size] or [1, hidden_size], squeeze the first dimension
+        if prompt_embed.ndim == 3 and prompt_embed.shape[0] == 1:
+            prompt_embed = prompt_embed.squeeze(0)
+        if pooled_prompt_embeds.ndim == 2 and pooled_prompt_embeds.shape[0] == 1:
+            pooled_prompt_embeds = pooled_prompt_embeds.squeeze(0)
+        
+        return prompt_embed, pooled_prompt_embeds, self.data_anno[idx]['caption']
 
     def __len__(self):
         return len(self.data_anno)
 
 
 def latent_collate_function(batch):
-    # return latent, prompt, latent_attn_mask, text_attn_mask
-    # latent_attn_mask: # b t h w
-    # text_attn_mask: b 1 l
-    # needs to check if the latent/prompt' size and apply padding & attn mask
-    prompt_embeds, pooled_prompt_embeds, text_ids, caption = zip(*batch)
-    # attn mask
+    """
+    Collate function for SD3.5 dataset
+    Returns: (prompt_embeds, pooled_prompt_embeds, captions)
+    Note: text_ids is delected (unlike Flux which needs it)
+    """
+    prompt_embeds, pooled_prompt_embeds, captions = zip(*batch)
+
+    # Stack embeddings
     prompt_embeds = torch.stack(prompt_embeds, dim=0)
     pooled_prompt_embeds = torch.stack(pooled_prompt_embeds, dim=0)
-    text_ids = torch.stack(text_ids, dim=0)
-    #latents = torch.stack(latents, dim=0)
-    return prompt_embeds, pooled_prompt_embeds, text_ids, caption
+    
+    return prompt_embeds, pooled_prompt_embeds, captions
 
 
 # if __name__ == "__main__":
