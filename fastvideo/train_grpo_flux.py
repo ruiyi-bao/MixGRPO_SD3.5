@@ -778,7 +778,7 @@ def main(args):
     transformer = FluxTransformer2DModel.from_pretrained(
             args.pretrained_model_name_or_path,
             subfolder="transformer",
-            torch_dtype = torch.float32
+            torch_dtype = torch.bfloat16
     )
     
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(

@@ -90,7 +90,7 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
-    pipe = FluxPipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16).to(device)
+    pipe = FluxPipeline.from_pretrained(args.model_path, torch_dtype=torch.bfloat16, device_map="balanced")
     # pipe = FluxPipeline.from_pretrained("./data/flux").to(device)
 
     json_data = []
