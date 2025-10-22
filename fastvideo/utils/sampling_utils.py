@@ -61,15 +61,7 @@ def run_sample_step(
         sigma = sigma_schedule[i]
         timestep_value = int(sigma * 1000)
         timesteps = torch.full([encoder_hidden_states.shape[0]], timestep_value, device=z.device, dtype=torch.long)
-        
-        # Debug output
-        if torch.distributed.get_rank() == 0 and i == 0:
-            print(f"\n[DEBUG run_sample_step] Step {i}")
-            print(f"  z shape: {z.shape}")
-            print(f"  encoder_hidden_states shape: {encoder_hidden_states.shape}")
-            print(f"  pooled_prompt_embeds shape: {pooled_prompt_embeds.shape}")
-            print(f"  timesteps shape: {timesteps.shape}, value: {timesteps}\n")
-        
+
         transformer.eval()
         with torch.autocast("cuda", torch.bfloat16):
             # SD3.5 doesn't use guidance, txt_ids, and img_ids like Flux

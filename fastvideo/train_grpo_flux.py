@@ -172,23 +172,10 @@ def sample_reference_model(
     for index, batch_idx in enumerate(batch_indices): # len(batch_indices)=12
         if dist.get_rank() == 0:
             meta_sampling_time = time.time()
-        
-        # Debug: print shapes before indexing
-        if dist.get_rank() == 0 and index == 0:
-            print(f"\n[DEBUG sample_reference_model] Before indexing:")
-            print(f"  encoder_hidden_states shape: {encoder_hidden_states.shape}")
-            print(f"  pooled_prompt_embeds shape: {pooled_prompt_embeds.shape}")
-            print(f"  batch_idx: {batch_idx}, type: {type(batch_idx)}")
-        
+
         batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
         batch_pooled_prompt_embeds = pooled_prompt_embeds[batch_idx]
         batch_caption = [caption[i] for i in batch_idx]
-        
-        # Debug: print shapes after indexing
-        if dist.get_rank() == 0 and index == 0:
-            print(f"[DEBUG sample_reference_model] After indexing:")
-            print(f"  batch_encoder_hidden_states shape: {batch_encoder_hidden_states.shape}")
-            print(f"  batch_pooled_prompt_embeds shape: {batch_pooled_prompt_embeds.shape}\n")
         if not args.init_same_noise:
             input_latents = torch.randn(
                     (len(batch_idx), IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
@@ -226,13 +213,16 @@ def sample_reference_model(
         all_latents.append(batch_latents)
         all_log_probs.append(batch_log_probs)
         vae.enable_tiling()
-        
-        image_processor = VaeImageProcessor(16)
+
+        # SD3.5 uses 16-channel VAE latents
+        image_processor = VaeImageProcessor(vae_scale_factor=8)
         rank = int(os.environ["RANK"])
 
         
         with torch.inference_mode():
             with torch.autocast("cuda", dtype=torch.bfloat16):
+                # SD3.5 VAE decoding: unscale and unshift latents
+                # Formula: image = (latents / scaling_factor) + shift_factor
                 latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
                 image = vae.decode(latents, return_dict=False)[0]
                 decoded_image = image_processor.postprocess(

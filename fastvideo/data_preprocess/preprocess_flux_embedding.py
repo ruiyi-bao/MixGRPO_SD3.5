@@ -100,16 +100,20 @@ def main(args):
                         latents = data["latents"]
                     for idx, video_name in enumerate(data["filename"]):
                         # SD3.5 encode_prompt returns (prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds)
+                        # We only keep the positive embeddings, not the negative ones
+                        caption_text = data["caption"][idx]
                         (
                             prompt_embeds,
                             negative_prompt_embeds,
                             pooled_prompt_embeds,
                             negative_pooled_prompt_embeds,
                         ) = pipe.encode_prompt(
-                            prompt=data["caption"],
-                            prompt_2=data["caption"],
-                            prompt_3=data["caption"],
+                            prompt=caption_text,
+                            prompt_2=caption_text,
+                            prompt_3=caption_text,
                             device=device,
+                            do_classifier_free_guidance=False,
+                            max_sequence_length=256,
                         )
                         prompt_embed_path = os.path.join(
                             args.output_dir, "prompt_embed", video_name + ".pt"
@@ -117,15 +121,15 @@ def main(args):
                         pooled_prompt_embeds_path = os.path.join(
                             args.output_dir, "pooled_prompt_embeds", video_name + ".pt"
                         )
-                        
-                        # Save embeddings
-                        torch.save(prompt_embeds, prompt_embed_path)
-                        torch.save(pooled_prompt_embeds, pooled_prompt_embeds_path)
-                        
+
+                        # Save embeddings (squeeze batch dimension since we process one at a time)
+                        torch.save(prompt_embeds.squeeze(0).cpu(), prompt_embed_path)
+                        torch.save(pooled_prompt_embeds.squeeze(0).cpu(), pooled_prompt_embeds_path)
+
                         item = {}
                         item["prompt_embed_path"] = video_name + ".pt"
-                        item["pooled_prompt_embeds_path"] = video_name + ".pt"   
-                        item["caption"] = data["caption"][idx]             
+                        item["pooled_prompt_embeds_path"] = video_name + ".pt"
+                        item["caption"] = caption_text
                         json_data.append(item)
         except Exception as e:
             print(f"Rank {local_rank} Error: {repr(e)}")
