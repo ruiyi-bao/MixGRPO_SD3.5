@@ -37,6 +37,7 @@ from fastvideo.utils.fsdp_util import get_dit_fsdp_kwargs, apply_fsdp_checkpoint
 from fastvideo.utils.load import load_transformer
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
+from diffusers import FlowMatchEulerDiscreteScheduler
 from fastvideo.dataset.latent_flux_rl_datasets import LatentDataset, latent_collate_function
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -58,7 +59,8 @@ import torch.distributed as dist
 from torch.nn import functional as F
 from typing import List
 from PIL import Image
-from diffusers import SD3Transformer2DModel, AutoencoderKL
+from diffusers import SD3Transformer2DModel, AutoencoderKL, StableDiffusion3Pipeline
+from fastvideo.pipelines import setup_sd3_pipeline_for_grpo
 from fastvideo.utils.grpo_states import GRPOTrainingStates
 import json
 from fastvideo.models.reward_model.image_reward import ImageRewardModel
@@ -126,118 +128,89 @@ def grpo_one_step(
 
 def sample_reference_model(
     args,
-    device, 
-    transformer,
-    vae,
-    encoder_hidden_states, 
-    pooled_prompt_embeds, 
+    device,
+    pipeline,  # Now takes pipeline instead of separate transformer/vae
+    encoder_hidden_states,
+    pooled_prompt_embeds,
     reward_models,
     caption,
     timesteps_train, # index
-    global_step, 
+    global_step,
     reward_weights,
+    neg_prompt_embed=None,
+    neg_pooled_embed=None,
 ):
-    w, h, t = args.w, args.h, args.t
+    """Sample using Flow-GRPO pipeline approach for high-quality images"""
+    w, h = args.w, args.h
     sample_steps = args.sampling_steps
-    sigma_schedule = torch.linspace(1, 0, args.sampling_steps + 1).to(device)
-    
-    sigma_schedule = sd3_time_shift(args.shift, sigma_schedule) # [1, 0], length=17
 
-    assert_eq(
-        len(sigma_schedule),
-        sample_steps + 1,
-        "sigma_schedule must have length sample_steps + 1",
-    )
+    # Get scheduler info for compatibility with training loop
+    scheduler = FlowMatchEulerDiscreteScheduler(shift=args.shift)
+    scheduler.set_timesteps(args.sampling_steps, device=device)
+    timesteps = scheduler.timesteps.to(device)
+    sigma_schedule = scheduler.sigmas.to(device)
 
     B = encoder_hidden_states.shape[0]
-    SPATIAL_DOWNSAMPLE = 8
-    IN_CHANNELS = 16
-    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
-
-    batch_size = 1  
+    batch_size = 1
     batch_indices = torch.chunk(torch.arange(B), B // batch_size)
 
     all_latents = []
     all_log_probs = []
-    all_rewards = []  
+    all_rewards = []
     all_multi_rewards = {}
-    if args.init_same_noise:
-        input_latents = torch.randn(
-                (1, IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
-                device=device,
-                dtype=torch.bfloat16,
-            )
+
+    rank = int(os.environ["RANK"])
+    image_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/images"
+    os.makedirs(image_dir, exist_ok=True)
+
     if dist.get_rank() == 0:
         sampling_time = 0
-    for index, batch_idx in enumerate(batch_indices): # len(batch_indices)=12
+
+    for index, batch_idx in enumerate(batch_indices):
         if dist.get_rank() == 0:
             meta_sampling_time = time.time()
 
         batch_encoder_hidden_states = encoder_hidden_states[batch_idx]
         batch_pooled_prompt_embeds = pooled_prompt_embeds[batch_idx]
         batch_caption = [caption[i] for i in batch_idx]
-        if not args.init_same_noise:
-            input_latents = torch.randn(
-                    (len(batch_idx), IN_CHANNELS, latent_h, latent_w),  #（c,t,h,w)
-                    device=device,
-                    dtype=torch.bfloat16,
-                )
-        input_latents_new = input_latents
-        #image_ids = prepare_latent_image_ids(len(batch_idx), latent_h // 2, latent_w // 2, device, torch.bfloat16)
-        grpo_sample=True
-        progress_bar = tqdm(range(0, sample_steps), desc="Sampling Progress", disable=not dist.is_initialized() or dist.get_rank() != 0)
 
-        if args.training_strategy == "part":
-            determistic = [True] * sample_steps
-            for i in timesteps_train:
-                determistic[i] = False
-        elif args.training_strategy == "all":
-            determistic = [False] * sample_steps
-
+        # Use text prompts directly instead of pre-encoded embeddings for better quality
+        # This matches the standalone test that generated perfect images
         with torch.no_grad():
-            z, latents, batch_latents, batch_log_probs = run_sample_step(
-                args,
-                input_latents_new,
-                progress_bar,
-                sigma_schedule,
-                transformer,
-                batch_encoder_hidden_states,
-                batch_pooled_prompt_embeds,
-                grpo_sample,
-                determistic=determistic,
+            images, batch_latents_list, batch_log_probs_list = pipeline.pipeline_with_logprob(
+                prompt=batch_caption[0],  # Use text prompt directly
+                num_inference_steps=sample_steps,
+                guidance_scale=args.cfg if args.cfg > 1.0 else 0.0,
+                output_type="pil",
+                height=h,
+                width=w,
             )
+
         if dist.get_rank() == 0:
             sampling_time += time.time() - meta_sampling_time
             main_print(f"##### Sampling time per data: {sampling_time/(index+1)} seconds")
-        
+
+        # Convert list of latents to tensor: batch_latents_list is [latent0, latent1, ..., latentN]
+        # Each latent is shape (B, C, H, W), stack to get (num_steps+1, B, C, H, W)
+        # Then permute to (B, num_steps+1, C, H, W) to match training expectations
+        batch_latents = torch.stack(batch_latents_list, dim=0).permute(1, 0, 2, 3, 4)  # (T+1, B, C, H, W) -> (B, T+1, C, H, W)
+        if batch_log_probs_list:
+            batch_log_probs = torch.stack(batch_log_probs_list, dim=0).permute(1, 0)  # (T, B) -> (B, T)
+        else:
+            batch_log_probs = torch.zeros(len(batch_idx), len(batch_latents_list)-1, device=device)
+
         all_latents.append(batch_latents)
         all_log_probs.append(batch_log_probs)
-        vae.enable_tiling()
 
-        # SD3.5 uses 16-channel VAE latents
-        image_processor = VaeImageProcessor(vae_scale_factor=8)
-        rank = int(os.environ["RANK"])
-
-        
-        with torch.inference_mode():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                # SD3.5 VAE decoding: unscale and unshift latents
-                # Formula: image = (latents / scaling_factor) + shift_factor
-                latents = (latents / vae.config.scaling_factor) + vae.config.shift_factor
-                image = vae.decode(latents, return_dict=False)[0]
-                decoded_image = image_processor.postprocess(
-                image)
-        image_dir = f"{args.output_dir}/{args.training_strategy}_{args.experiment_name}/images"
-        os.makedirs(image_dir, exist_ok=True)
+        # Save first image from this batch
         if index == 0:
-            decoded_image[0].save(f"{image_dir}/sd35_{global_step}_{rank}.png")
+            images[0].save(f"{image_dir}/sd35_{global_step}_{rank}_final.png")
 
-        # compute rewards
+        # Compute rewards using the decoded images
         with torch.no_grad():
-            images = [decoded_image[0]]
             prompts = [batch_caption[0]]
             rewards, successes, rewards_dict, successes_dict = compute_reward(
-                images, 
+                images[:1],  # Just the first image
                 prompts,
                 reward_models,
                 reward_weights,
@@ -255,7 +228,7 @@ def sample_reference_model(
                         torch.tensor(successes_dict[model_name], device=device, dtype=torch.float32)
                     )
 
-    # TODO: add the logic code for verifying success
+    # Concatenate all results
     all_latents = torch.cat(all_latents, dim=0)
     all_log_probs = torch.cat(all_log_probs, dim=0)
     if args.multi_reward_mix == "reward_aggr":
@@ -264,8 +237,8 @@ def sample_reference_model(
         all_rewards_res = {}
         for model_name, model_rewards in all_multi_rewards.items():
             all_rewards_res[model_name] = torch.cat(model_rewards["rewards"], dim=0)
-    
-    return all_rewards_res, all_latents, all_log_probs, sigma_schedule
+
+    return all_rewards_res, all_latents, all_log_probs, timesteps, sigma_schedule
 
 
 def gather_tensor(tensor):
@@ -280,7 +253,7 @@ def train_one_step(
     args,
     device,
     transformer,
-    vae,
+    reference_pipeline,  # Pipeline for sampling, separate from training transformer
     reward_models,
     optimizer,
     lr_scheduler,
@@ -290,6 +263,8 @@ def train_one_step(
     timesteps_train, # index
     global_step,
     reward_weights,
+    neg_prompt_embed=None,
+    neg_pooled_embed=None,
 ):
     total_loss = 0.0
     kl_total_loss = 0.0
@@ -320,24 +295,24 @@ def train_one_step(
         else:
             raise ValueError(f"Unsupported caption type: {type(caption)}")
 
-    reward, all_latents, all_log_probs, sigma_schedule = sample_reference_model(
+    # Use reference pipeline for high-quality sampling
+    reward, all_latents, all_log_probs, timesteps_from_scheduler, sigma_schedule = sample_reference_model(
             args,
-            device, 
-            transformer,
-            vae,
-            encoder_hidden_states, 
-            pooled_prompt_embeds, 
+            device,
+            reference_pipeline,
+            encoder_hidden_states,
+            pooled_prompt_embeds,
             reward_models,
             caption,
             timesteps_train,
             global_step,
             reward_weights,
+            neg_prompt_embed=neg_prompt_embed if args.cfg > 1.0 else None,
+            neg_pooled_embed=neg_pooled_embed if args.cfg > 1.0 else None,
         )
     batch_size = all_latents.shape[0]
-    timestep_value = [int(sigma * 1000) for sigma in sigma_schedule][:args.sampling_steps]
-    timestep_values = [timestep_value[:] for _ in range(batch_size)]
-    device = all_latents.device
-    timesteps =  torch.tensor(timestep_values, device=all_latents.device, dtype=torch.long)
+    # Use scheduler timesteps directly instead of int(sigma * 1000)
+    timesteps = timesteps_from_scheduler.unsqueeze(0).expand(batch_size, -1)
 
     samples = {
         "timesteps": timesteps.detach().clone()[:, :-1],
@@ -435,7 +410,13 @@ def train_one_step(
                 "multi_reward_mix 'advantage_aggr' is not supported when use_group is False."
             )
         elif args.multi_reward_mix == "reward_aggr":
-            advantages = (samples["rewards"] - gathered_reward.mean())/(gathered_reward.std()+1e-8)
+            # Use unbiased=False to avoid NaN when there's only 1 sample
+            reward_std = gathered_reward.std(unbiased=False)
+            # Handle case when std is 0 (all rewards are the same)
+            if reward_std < 1e-8 or torch.isnan(reward_std):
+                advantages = torch.zeros_like(samples["rewards"])
+            else:
+                advantages = (samples["rewards"] - gathered_reward.mean())/(reward_std + 1e-8)
             samples["advantages"] = advantages
         else:
             raise ValueError(
@@ -487,6 +468,8 @@ def train_one_step(
             )
     if dist.get_rank() == 0:
         optimize_sampling_time = 0
+
+    grad_norm = torch.tensor(0.0)  # Initialize grad_norm
 
     for i,sample in list(enumerate(samples_batched_list)):
         for _ in train_timesteps:
@@ -725,7 +708,7 @@ def main(args):
             args.pretrained_model_name_or_path,
             subfolder="transformer",
     )
-    
+
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
         transformer,
         args.fsdp_sharding_startegy,
@@ -733,7 +716,7 @@ def main(args):
         args.use_cpu_offload,
         args.master_weight_type,
     )
-    
+
     transformer = FSDP(transformer, **fsdp_kwargs,)
 
     if args.gradient_checkpointing:
@@ -747,6 +730,16 @@ def main(args):
         subfolder="vae",
         torch_dtype = torch.bfloat16,
     ).to(device)
+
+    # Load reference pipeline for high-quality sampling (Flow-GRPO approach)
+    main_print(f"--> Loading reference pipeline for sampling...")
+    reference_pipeline = StableDiffusion3Pipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        torch_dtype=torch.bfloat16,
+    )
+    reference_pipeline = reference_pipeline.to(device)
+    reference_pipeline = setup_sd3_pipeline_for_grpo(reference_pipeline)
+    main_print(f"--> Reference pipeline loaded and ready")
 
     main_print(
         f"--> Initializing FSDP with sharding strategy: {args.fsdp_sharding_startegy}"
@@ -784,10 +777,11 @@ def main(args):
     )
 
     train_dataset = LatentDataset(args.data_json_path, args.num_latent_t, args.cfg)
+    sampler_seed = args.sampler_seed if args.sampler_seed is not None else args.seed if args.seed is not None else 42
     sampler = DistributedSampler(
-            train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=args.sampler_seed
+            train_dataset, rank=rank, num_replicas=world_size, shuffle=True, seed=sampler_seed
         )
-    
+
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -798,6 +792,19 @@ def main(args):
         num_workers=args.dataloader_num_workers,
         drop_last=True,
     )
+
+    # Load negative embeddings for CFG if cfg > 1.0
+    if args.cfg > 1.0:
+        neg_embed_dir = os.path.dirname(args.data_json_path)
+        neg_prompt_embed_path = os.path.join(neg_embed_dir, "neg_prompt_embed.pt")
+        neg_pooled_embed_path = os.path.join(neg_embed_dir, "neg_pooled_prompt_embed.pt")
+
+        neg_prompt_embed = torch.load(neg_prompt_embed_path, map_location=f"cuda:{device}").unsqueeze(0)  # Add batch dim
+        neg_pooled_embed = torch.load(neg_pooled_embed_path, map_location=f"cuda:{device}").unsqueeze(0)
+        main_print(f"Loaded negative embeddings for CFG (guidance_scale={args.cfg})")
+    else:
+        neg_prompt_embed = None
+        neg_pooled_embed = None
 
     #vae.enable_tiling()
 
@@ -895,9 +902,9 @@ def main(args):
 
             loss, grad_norm, policy_loss, kl_loss, clip_frac, reward = train_one_step(
                 args,
-                device, 
+                device,
                 transformer,
-                vae,
+                reference_pipeline,
                 reward_models,
                 optimizer,
                 lr_scheduler,
@@ -907,6 +914,8 @@ def main(args):
                 timesteps_train,
                 global_step,
                 reward_weights,
+                neg_prompt_embed,
+                neg_pooled_embed,
             )
     
             step_time = time.time() - start_time
@@ -994,6 +1003,16 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--save_intermediate_steps",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of denoising steps to save as images (e.g., '1,5,10,15,20'). "
+            "Useful for debugging and visualizing the denoising process during training. "
+            "If not specified, only the final image is saved."
+        ),
     )
     parser.add_argument(
         "--checkpointing_steps",
@@ -1153,8 +1172,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eta",
         type=float,
-        default=None,   
-        help="noise eta",
+        default=1.0,
+        help="noise eta (default: 1.0 for stochastic sampling)",
     )
     parser.add_argument(
         "--sampler_seed",
@@ -1402,9 +1421,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--multi_reward_mix",
         type=str,
-        default="advantage_aggr",
+        default="reward_aggr",
         choices=["advantage_aggr", "reward_aggr"],
-        help="How to mix multiple rewards",
+        help="How to mix multiple rewards (use 'reward_aggr' when use_group is False)",
     )
     parser.add_argument(
         "--hps_weight",
